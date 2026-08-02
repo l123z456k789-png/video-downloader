@@ -32,6 +32,9 @@ venv/
 .idea/
 .claude/
 
+# 自动审计报告（包含个人路径）
+.repoclinic/
+
 # OS
 Thumbs.db
 .DS_Store
