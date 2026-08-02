@@ -1,0 +1,6 @@
+# Video Downloader — Python 依赖
+# 安装: pip install -r requirements.txt
+
+pyyaml>=6.0
+curl_cffi>=0.7
+httpx>=0.28

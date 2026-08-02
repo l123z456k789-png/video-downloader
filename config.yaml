@@ -1,0 +1,43 @@
+# ============================================================
+# Video Downloader — 默认配置文件
+# 本地覆盖: 复制为 config.local.yaml（不会被 git 跟踪）
+# ============================================================
+
+downloader:
+  output_dir: videos
+  format: bestvideo+bestaudio/best
+  merge_format: mp4
+  playlist: false
+  continue_download: true
+  retries: 5
+  socket_timeout: 30
+
+tools:
+  yt_dlp_path: yt-dlp
+  ffmpeg_path: ffmpeg
+  deno_path: ""
+
+browser:
+  cookies_from_browser: chrome
+
+# 浏览器伪装 (curl_cffi): 模拟真实浏览器 TLS 指纹
+# 抖音/TikTok 等平台需要。设为 "" 禁用
+impersonate:
+  target: chrome-131
+
+audio:
+  codec: aac
+  bitrate: 192k
+
+logging:
+  level: INFO
+  directory: logs
+
+# ---- 平台特定配置 ----
+platforms:
+  douyin:
+    user_agent: "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/131.0.0.0 Safari/537.36"
+    referer: "https://www.douyin.com/"
+  tiktok:
+    user_agent: "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/131.0.0.0 Safari/537.36"
+    referer: "https://www.tiktok.com/"

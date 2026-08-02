@@ -1,0 +1,40 @@
+# 下载输出
+videos/
+*.mp4
+*.mkv
+*.webm
+
+# 临时文件
+.tmp/
+.temp.*
+
+# Cookie — 包含登录凭证，绝对不能提交
+cookies.txt
+cookies/*.txt
+!cookies/README.md
+
+# 日志
+logs/*.log
+
+# 本地配置覆盖（包含个人路径）
+config.local.yaml
+
+# Python
+__pycache__/
+*.pyc
+*.pyo
+.venv/
+venv/
+.pytest_cache/
+
+# IDE
+.vscode/
+.idea/
+.claude/
+
+# OS
+Thumbs.db
+.DS_Store
+
+# 旧版本保留
+old/
