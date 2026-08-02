@@ -38,3 +38,6 @@ Thumbs.db
 
 # 旧版本保留
 old/
+
+# 浏览器 profile（持久化登录状态）
+douyin_profile/

@@ -18,8 +18,6 @@ import time
 from pathlib import Path
 from typing import Any
 
-import httpx
-
 from .base import BaseExtractor, ExtractResult, VideoInfo, register
 
 DOUYIN_DOMAINS = [
@@ -57,55 +55,83 @@ def _extract_video_id(url: str) -> str | None:
 
 
 def _extract_from_api_json(data: dict) -> list[VideoInfo]:
-    """从抖音 API 响应 JSON 中提取视频地址。"""
-    videos: list[VideoInfo] = []
-    found_urls: set[str] = set()
+    """从抖音 API 响应 JSON 中提取视频地址。
 
-    def _search(obj: Any, depth: int = 0) -> None:
-        if depth > 20 or len(found_urls) >= 10:
-            return
-        if isinstance(obj, dict):
-            for key in obj:
-                if key in (
-                    "play_addr", "play_addr_h264",
-                    "download_addr", "download_addr_h264",
-                    "playApi", "downloadApi",
-                ):
-                    addr = obj[key]
+    优先选择:
+        1. download_addr — 无水印，最高画质
+        2. play_addr — 有水印，画质稍低
+    只返回 1 个最佳视频，不要一股脑把所有 URL 都列出来。
+    """
+    # 找到 aweme_detail（视频主体数据）
+    aweme = data.get("aweme_detail") or data
+    if isinstance(aweme, list):
+        aweme = aweme[0] if aweme else {}
+
+    video = aweme.get("video", {}) if isinstance(aweme, dict) else {}
+
+    title = str(
+        aweme.get("desc", "")
+        or aweme.get("share_info", {}).get("share_title", "")
+        or data.get("desc", "")
+    ) if isinstance(aweme, dict) else ""
+
+    def _best_url(addr_dict: dict) -> str:
+        """从 addr 字典中选最高画质的 URL。"""
+        url_list = addr_dict.get("url_list") or addr_dict.get("urlList") or []
+        # url_list 通常是 [低画质, ..., 最高画质]，取最后一个
+        if url_list:
+            return str(url_list[-1])
+        return ""
+
+    # 优先 download_addr（无水印）
+    download = video.get("download_addr") or video.get("download_addr_h264") or {}
+    best_url = _best_url(download) if isinstance(download, dict) else ""
+
+    # 回退 play_addr（有水印）
+    if not best_url:
+        play = video.get("play_addr") or video.get("play_addr_h264") or {}
+        best_url = _best_url(play) if isinstance(play, dict) else ""
+
+    if not best_url:
+        # 最坏情况：递归搜索（兜底）
+        found_urls: list[str] = []
+
+        def _search(obj: Any, depth: int = 0) -> None:
+            if depth > 15 or len(found_urls) >= 1:
+                return
+            if isinstance(obj, dict):
+                for key in ("download_addr", "download_addr_h264", "play_addr", "play_addr_h264"):
+                    addr = obj.get(key)
                     if isinstance(addr, dict):
-                        url_list = (
-                            addr.get("url_list")
-                            or addr.get("urlList")
-                            or addr.get("UrlList")
-                            or []
-                        )
-                        for u in url_list:
-                            if isinstance(u, str) and u not in found_urls:
-                                found_urls.add(u)
-                if isinstance(obj.get(key), (dict, list)):
-                    _search(obj[key], depth + 1)
-        elif isinstance(obj, list):
-            for item in obj:
-                _search(item, depth + 1)
+                        u = _best_url(addr)
+                        if u:
+                            found_urls.append(u)
+                            return
+                for k, v in obj.items():
+                    if isinstance(v, (dict, list)):
+                        _search(v, depth + 1)
+            elif isinstance(obj, list):
+                for item in obj[:3]:
+                    _search(item, depth + 1)
 
-    _search(data)
+        if isinstance(aweme, dict):
+            _search(aweme)
+        if not found_urls:
+            _search(data)
+        best_url = found_urls[0] if found_urls else ""
 
-    download_urls = [u for u in found_urls if "download" in u.lower()]
-    play_urls = [u for u in found_urls if "play" in u.lower()]
-    other_urls = [u for u in found_urls if u not in download_urls and u not in play_urls]
+    if not best_url:
+        return []
 
-    for url in download_urls + play_urls + other_urls:
-        videos.append(
-            VideoInfo(
-                url=url,
-                title=str(data.get("desc", "") or data.get("share_info", {}).get("share_title", "")),
-                platform="douyin",
-                ext="mp4",
-                is_watermarked=("play" in url.lower() and "download" not in url.lower()),
-            )
+    return [
+        VideoInfo(
+            url=best_url,
+            title=title,
+            platform="douyin",
+            ext="mp4",
+            is_watermarked=("download" not in best_url.lower()),
         )
-
-    return videos
+    ]
 
 
 @register
@@ -113,6 +139,11 @@ class DouyinExtractor(BaseExtractor):
     """抖音视频提取器 — Playwright 浏览器渲染。"""
 
     platform = "douyin"
+
+    def __init__(self) -> None:
+        # 持久化浏览器 profile，避免每次运行都创建新的临时 profile
+        root = Path(__file__).resolve().parent.parent
+        self._profile_dir = str(root / "douyin_profile")
 
     def supports(self, url: str) -> bool:
         return any(domain in url for domain in DOUYIN_DOMAINS)
@@ -130,22 +161,20 @@ class DouyinExtractor(BaseExtractor):
         captured_responses: list[dict] = []
 
         def _on_response(response) -> None:
-            """拦截 API 响应，捕获视频数据。"""
-            try:
-                if "aweme/detail" in response.url or "web/aweme" in response.url:
+            if "aweme/detail" in response.url:
+                try:
                     body = response.json()
                     if body:
                         captured_responses.append(body)
-            except Exception:
-                pass
+                except Exception:
+                    pass
 
-        pw = None
-        browser = None
+        context = None
         try:
             pw = sync_playwright().start()
 
-            # 使用系统 Chrome（不需要额外下载 Chromium）
-            browser = pw.chromium.launch(
+            context = pw.chromium.launch_persistent_context(
+                user_data_dir=self._profile_dir,
                 channel="chrome",
                 headless=True,
                 args=[
@@ -153,53 +182,35 @@ class DouyinExtractor(BaseExtractor):
                     "--no-sandbox",
                     "--disable-dev-shm-usage",
                 ],
-            )
-
-            context = browser.new_context(
-                user_agent=_HEADERS["User-Agent"],
                 viewport={"width": 1920, "height": 1080},
                 locale="zh-CN",
+                user_agent=_HEADERS["User-Agent"],
             )
 
-            page = context.new_page()
+            page = context.pages[0] if context.pages else context.new_page()
             page.on("response", _on_response)
 
             print("  [浏览器] 正在渲染页面...")
             page.goto(url, wait_until="domcontentloaded", timeout=30000)
 
-            # 等待视频数据加载
+            # 等待 API 响应（视频数据）
+            page.wait_for_timeout(8000)
+
+            # 尝试从 DOM 提取 video src 作为备用
             try:
-                page.wait_for_function(
-                    """
-                    () => {
-                        return document.querySelector('video') ||
-                               document.querySelector('[data-e2e="feed-active-video"]') ||
-                               window._ROUTER_DATA;
-                    }
-                    """,
-                    timeout=15000,
-                )
+                video_src = page.evaluate(
+                    """() => {
+                        const v = document.querySelector('video');
+                        if (v) return v.currentSrc || v.src || '';
+                        return '';
+                    }"""
+                ).strip()
+                if video_src and video_src.startswith("http"):
+                    captured_responses.append(
+                        {"_video_src": video_src, "desc": page.title()}
+                    )
             except Exception:
                 pass
-
-            # 额外等待网络请求完成
-            page.wait_for_timeout(3000)
-
-            # 尝试从 DOM 提取 video src
-            video_src = page.evaluate(
-                """
-                () => {
-                    const v = document.querySelector('video');
-                    if (v) return v.currentSrc || v.src || '';
-                    return '';
-                }
-                """
-            ).strip()
-
-            if video_src and video_src.startswith("http"):
-                captured_responses.append(
-                    {"_video_src": video_src, "desc": page.title()}
-                )
 
         except Exception as e:
             return ExtractResult(
@@ -208,18 +219,18 @@ class DouyinExtractor(BaseExtractor):
                 fallback_url=url,
             )
         finally:
-            if browser:
+            if context:
                 try:
-                    browser.close()
+                    context.close()
                 except Exception:
                     pass
-            if pw:
+            if 'pw' in dir():
                 try:
                     pw.stop()
                 except Exception:
                     pass
 
-        # 分析捕获的数据
+        # 分析捕获的响应
         if not captured_responses:
             return ExtractResult(
                 success=False,
@@ -231,20 +242,26 @@ class DouyinExtractor(BaseExtractor):
                 fallback_url=url,
             )
 
-        # 从捕获的响应中提取视频
         all_videos: list[VideoInfo] = []
+        seen_urls: set[str] = set()
         for data in captured_responses:
             if "_video_src" in data:
-                all_videos.append(
-                    VideoInfo(
-                        url=data["_video_src"],
-                        title=data.get("desc", ""),
-                        platform="douyin",
-                        ext="mp4",
+                url = data["_video_src"]
+                if url not in seen_urls:
+                    seen_urls.add(url)
+                    all_videos.append(
+                        VideoInfo(
+                            url=url,
+                            title=data.get("desc", ""),
+                            platform="douyin",
+                            ext="mp4",
+                        )
                     )
-                )
             else:
-                all_videos.extend(_extract_from_api_json(data))
+                for v in _extract_from_api_json(data):
+                    if v.url not in seen_urls:
+                        seen_urls.add(v.url)
+                        all_videos.append(v)
 
         if not all_videos:
             return ExtractResult(
@@ -256,7 +273,5 @@ class DouyinExtractor(BaseExtractor):
         return ExtractResult(success=True, videos=all_videos)
 
     def close(self) -> None:
-        """清理资源。"""
-        if self._client is not None:
-            self._client.close()
-            self._client = None
+        """清理资源（持久化 profile 保留以便下次复用）。"""
+        pass
