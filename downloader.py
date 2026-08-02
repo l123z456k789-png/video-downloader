@@ -16,7 +16,7 @@ import sys
 from pathlib import Path
 from typing import Any
 
-import httpx
+from extractors.http_downloader import download as safe_download
 
 
 class DownloadError(Exception):
@@ -358,53 +358,6 @@ def _run_process(
     )
 
 
-def _download_direct_url(url: str, output_path: str) -> bool:
-    """通过 HTTP 直接下载视频文件（用于自定义提取器获取的 CDN 直链）。
-
-    Args:
-        url: 视频 CDN 直链
-        output_path: 输出文件完整路径
-
-    Returns:
-        是否成功
-    """
-    try:
-        client = httpx.Client(
-            headers={
-                "User-Agent": (
-                    "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
-                    "AppleWebKit/537.36 (KHTML, like Gecko) "
-                    "Chrome/131.0.0.0 Safari/537.36"
-                ),
-                "Referer": "https://www.douyin.com/",
-            },
-            timeout=120.0,
-            follow_redirects=True,
-        )
-
-        Path(output_path).parent.mkdir(parents=True, exist_ok=True)
-
-        with client.stream("GET", url) as resp:
-            resp.raise_for_status()
-            total = int(resp.headers.get("content-length", 0))
-            downloaded = 0
-            with open(output_path, "wb") as f:
-                for chunk in resp.iter_bytes(chunk_size=8192):
-                    f.write(chunk)
-                    downloaded += len(chunk)
-                    if total > 0:
-                        pct = downloaded * 100 // total
-                        mb = downloaded / (1024 * 1024)
-                        total_mb = total / (1024 * 1024)
-                        print(f"\r  下载进度: {pct}%  ({mb:.1f}/{total_mb:.1f} MB)", end="", flush=True)
-            if total > 0:
-                print()
-            return True
-    except Exception as e:
-        print(f"\n  直接下载失败: {e}")
-        return False
-
-
 def run_hybrid_download(
     config: dict[str, Any],
     url: str,
@@ -470,16 +423,29 @@ def run_hybrid_download(
         safe_title = "".join(c for c in title if c not in r'<>:"/\|?*')[:100]
         if not safe_title.strip():
             safe_title = f"{ext.platform}_video_{i}"
-        output_path = str(output_dir / f"{safe_title}.{video.ext}")
+        filename = f"{safe_title}.{video.ext}"
 
         print(f"\n[{i + 1}/{len(videos)}] {safe_title}")
         print(f"  地址: {video.url[:80]}...")
 
-        if _download_direct_url(video.url, output_path):
-            print(f"  [OK] 已保存: {output_path}")
+        dl_result = safe_download(
+            url=video.url,
+            output_dir=output_dir,
+            filename=filename,
+            headers={
+                "User-Agent": (
+                    "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
+                    "AppleWebKit/537.36 (KHTML, like Gecko) "
+                    "Chrome/131.0.0.0 Safari/537.36"
+                ),
+                "Referer": "https://www.douyin.com/",
+            },
+        )
+        if dl_result.success:
+            print(f"  [OK] 已保存: {dl_result.output_path}")
             success_count += 1
         else:
-            print(f"  [FAIL] 下载失败")
+            print(f"  [FAIL] 下载失败: {dl_result.error}")
 
     if success_count > 0:
         print(f"\n[OK] 成功下载 {success_count}/{len(videos)} 个视频")
