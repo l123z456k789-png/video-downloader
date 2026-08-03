@@ -139,8 +139,9 @@ def log_event(
     if extra:
         # 对 URL 做简单脱敏：去掉 query string 中的敏感部分
         for key, value in extra.items():
-            if isinstance(value, str) and len(value) > 200:
-                value = value[:200] + "..."
+            if isinstance(value, str) and len(value) > 800:
+                # 保留尾部（yt-dlp 的关键错误在末尾）
+                value = "..." + value[-800:]
             parts.append(f"{key}={value}")
 
     msg = " ".join(parts)

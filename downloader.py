@@ -17,6 +17,7 @@ from pathlib import Path
 from typing import Any
 
 from extractors.http_downloader import download as safe_download
+from logger import get_logger, log_event, new_task_id
 
 
 class DownloadError(Exception):
@@ -381,26 +382,37 @@ def run_hybrid_download(
     """
     from extractors import find_extractor
 
+    task_id = new_task_id()
+    log_event(task_id, "hybrid_download_start", {"platform": platform, "url": url})
+
     ext = find_extractor(url)
     if ext is None:
-        # 没有自定义提取器 → 直接用 yt-dlp
+        log_event(task_id, "no_extractor_found", {"platform": platform})
         return run_download(config, url)
 
+    log_event(task_id, "extractor_start", {"platform": ext.platform})
     print(f"\n[INFO] 检测到 {ext.platform} 链接，尝试专用提取器...")
 
     try:
         result = ext.extract(url)
     except Exception as e:
+        log_event(task_id, "extractor_failed", {
+            "platform": ext.platform, "error_type": type(e).__name__, "error": str(e)[:200],
+        }, level="WARNING")
         print(f"[WARN] 提取器异常: {e}，回退到 yt-dlp")
+        log_event(task_id, "fallback_start", {"platform": platform, "reason": "extractor_exception"})
         return run_download(config, url)
 
     if not result.success:
+        log_event(task_id, "extractor_failed", {
+            "platform": ext.platform, "error": (result.error or "")[:200],
+        }, level="WARNING")
         print(f"[WARN] 提取器失败: {result.error}")
         print("[INFO] 回退到 yt-dlp 下载...")
+        log_event(task_id, "fallback_start", {"platform": platform, "reason": "extractor_no_result"})
         try:
             return run_download(config, url)
         except DownloadError:
-            # 如果 yt-dlp 也失败了，给出更明确的提示
             raise DownloadError(
                 f"{result.error}\n\n"
                 "专用提取器和 yt-dlp 均失败。\n"
@@ -415,11 +427,25 @@ def run_hybrid_download(
     output_dir = Path(__file__).resolve().parent / config["downloader"]["output_dir"]
     output_dir.mkdir(parents=True, exist_ok=True)
 
+    # 从 app config 构建安全下载器配置
+    dl_cfg = config["downloader"]
+    from extractors.http_downloader import DownloadConfig
+    safe_config = DownloadConfig(
+        connect_timeout=float(dl_cfg.get("socket_timeout", 30)),
+        read_timeout=300.0,
+        max_retries=dl_cfg.get("retries", 3),
+    )
+
+    log_event(task_id, "extractor_success", {
+        "platform": ext.platform, "video_count": str(len(videos)),
+    })
+    log_event(task_id, "direct_download_start", {"video_count": str(len(videos))})
+
+    direct_errors: list[str] = []
     success_count = 0
+    total_bytes = 0
     for i, video in enumerate(videos):
-        # 构建文件名
         title = video.title or f"{ext.platform}_{i}"
-        # 清理文件名中的非法字符
         safe_title = "".join(c for c in title if c not in r'<>:"/\|?*')[:100]
         if not safe_title.strip():
             safe_title = f"{ext.platform}_video_{i}"
@@ -428,28 +454,64 @@ def run_hybrid_download(
         print(f"\n[{i + 1}/{len(videos)}] {safe_title}")
         print(f"  地址: {video.url[:80]}...")
 
-        dl_result = safe_download(
-            url=video.url,
-            output_dir=output_dir,
-            filename=filename,
-            headers={
-                "User-Agent": (
-                    "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
-                    "AppleWebKit/537.36 (KHTML, like Gecko) "
-                    "Chrome/131.0.0.0 Safari/537.36"
-                ),
-                "Referer": "https://www.douyin.com/",
-            },
-        )
+        try:
+            dl_result = safe_download(
+                url=video.url,
+                output_dir=output_dir,
+                filename=filename,
+                headers={
+                    "User-Agent": (
+                        "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
+                        "AppleWebKit/537.36 (KHTML, like Gecko) "
+                        "Chrome/131.0.0.0 Safari/537.36"
+                    ),
+                    "Referer": "https://www.douyin.com/",
+                },
+                config=safe_config,
+            )
+        except Exception as e:
+            dl_result = type("R", (), {"success": False, "error": str(e)})()  # type: ignore[assignment]
+
         if dl_result.success:
             print(f"  [OK] 已保存: {dl_result.output_path}")
             success_count += 1
+            total_bytes += getattr(dl_result, "bytes_downloaded", 0)
         else:
-            print(f"  [FAIL] 下载失败: {dl_result.error}")
+            err = getattr(dl_result, "error", "未知错误") or "未知错误"
+            print(f"  [FAIL] 下载失败: {err}")
+            direct_errors.append(f"[{safe_title}] {err}")
 
     if success_count > 0:
         print(f"\n[OK] 成功下载 {success_count}/{len(videos)} 个视频")
-        # 返回一个假的 CompletedProcess 表示成功
+        log_event(task_id, "direct_download_complete", {
+            "platform": platform, "success_count": str(success_count),
+            "total_videos": str(len(videos)), "bytes_downloaded": str(total_bytes),
+        })
         return subprocess.CompletedProcess(args=["extractor"], returncode=0, stdout="", stderr="")
-    else:
-        raise DownloadError("所有视频地址下载失败", exit_code=-1)
+
+    # 全部直链失败 → 回退 yt-dlp（原始页面 URL）
+    fallback_reason = "; ".join(direct_errors[:3])
+    log_event(task_id, "direct_download_failed", {
+        "platform": platform, "reason": fallback_reason[:300],
+    }, level="WARNING")
+    print(f"\n[WARN] 直链下载全部失败，回退到 yt-dlp...")
+    print(f"[INFO] 回退原因: {fallback_reason}")
+
+    log_event(task_id, "fallback_start", {
+        "platform": platform, "reason": "direct_download_failed",
+    })
+    try:
+        result = run_download(config, url)
+        log_event(task_id, "fallback_complete", {"platform": platform})
+        return result
+    except DownloadError as yt_error:
+        log_event(task_id, "fallback_failed", {
+            "platform": platform,
+            "error_type": type(yt_error).__name__,
+            "error": str(yt_error)[:300],
+        }, level="ERROR")
+        raise DownloadError(
+            f"直链下载失败: {fallback_reason}\n"
+            f"yt-dlp 回退也失败: {yt_error}",
+            exit_code=yt_error.exit_code if yt_error.exit_code > 0 else -1,
+        )

@@ -141,17 +141,19 @@ def main() -> int:
         return 7
     except DownloadError as e:
         print(f"\n[ERROR] {e}")
+        err_text = str(e)
         log_event(task_id, "download_failed", {
             "platform": platform,
             "exit_code": str(e.exit_code),
-            "error": str(e)[:200],
+            "error": err_text[-800:] if len(err_text) > 800 else err_text,
         }, level="ERROR")
         return e.exit_code if e.exit_code > 0 else 1
     except Exception as e:
         print(f"\n[ERROR] 未知错误: {e}")
+        err_text = str(e)
         log_event(task_id, "download_failed", {
             "platform": platform,
-            "error": str(e)[:200],
+            "error": err_text[-800:] if len(err_text) > 800 else err_text,
         }, level="ERROR")
         logger.exception("unexpected_error")
         return 1

@@ -1021,6 +1021,262 @@ class TestOutputPrivacy:
 # 资源关闭测试
 # ============================================================
 
+# ============================================================
+# SafeTransport handle_request 契约测试
+# ============================================================
+
+class TestSafeTransportHandleRequest:
+    """验证 SafeTransport.handle_request 正确适配 httpcore → httpx。"""
+
+    def test_streaming_body_readable(self):
+        """流式响应 body 必须可读取，不会触发 RuntimeError 或 StreamClosed。"""
+        import httpcore
+        from extractors.http_downloader import SafeTransport
+
+        transport = SafeTransport()
+        # 用 mock 替换内部 pool，返回流式 httpcore.Response
+        fake_stream = iter([b"chunk1", b"chunk2"])
+        fake_core = httpcore.Response(
+            200,
+            headers=[(b"content-type", b"video/mp4")],
+            content=fake_stream,
+        )
+
+        def fake_handle(core_req):
+            return fake_core
+
+        transport._pool.handle_request = fake_handle  # type: ignore[assignment]
+
+        httpx_req = httpx.Request("GET", "https://cdn.example.com/video.mp4")
+        httpx_resp = transport.handle_request(httpx_req)
+
+        assert httpx_resp.status_code == 200
+        assert httpx_resp.headers["content-type"] == "video/mp4"
+        # 必须能正常读取 body
+        body = httpx_resp.read()
+        assert body == b"chunk1chunk2"
+
+    def test_status_and_headers_converted(self):
+        """status code 和所有 headers 正确传递。"""
+        import httpcore
+        from extractors.http_downloader import SafeTransport
+
+        transport = SafeTransport()
+        fake_core = httpcore.Response(
+            404,
+            headers=[
+                (b"content-type", b"text/plain"),
+                (b"x-custom", b"value1"),
+            ],
+            content=b"not found",
+        )
+
+        def fake_handle(core_req):
+            return fake_core
+
+        transport._pool.handle_request = fake_handle  # type: ignore[assignment]
+
+        httpx_req = httpx.Request("GET", "https://cdn.example.com/missing")
+        httpx_resp = transport.handle_request(httpx_req)
+
+        assert httpx_resp.status_code == 404
+        assert httpx_resp.headers["content-type"] == "text/plain"
+        assert httpx_resp.headers["x-custom"] == "value1"
+
+    def test_close_propagates_to_pool(self):
+        """transport.close() 必须关闭底层连接池。"""
+        from extractors.http_downloader import SafeTransport
+
+        transport = SafeTransport()
+        close_called = []
+
+        def fake_close():
+            close_called.append(True)
+
+        transport._pool.close = fake_close  # type: ignore[assignment]
+        transport.close()
+        assert len(close_called) == 1
+
+    def test_extensions_preserved_from_httpcore(self):
+        """httpcore 响应的 extensions 字典必须传递到 httpx.Response。"""
+        import httpcore
+        from extractors.http_downloader import SafeTransport
+
+        transport = SafeTransport()
+        fake_core = httpcore.Response(
+            200,
+            headers=[(b"content-type", b"video/mp4")],
+            content=b"ok",
+            extensions={"http_version": b"HTTP/1.1", "reason_phrase": b"OK"},
+        )
+
+        def fake_handle(core_req):
+            return fake_core
+
+        transport._pool.handle_request = fake_handle  # type: ignore[assignment]
+
+        httpx_req = httpx.Request("GET", "https://cdn.example.com/video.mp4")
+        httpx_resp = transport.handle_request(httpx_req)
+
+        assert httpx_resp.extensions["http_version"] == b"HTTP/1.1"
+        assert httpx_resp.extensions["reason_phrase"] == b"OK"
+
+
+# ============================================================
+# 流式下载生命周期测试
+# ============================================================
+
+class TestStreamingLifecycle:
+    """验证 download() 正确处理流式响应 — 数据在 with 块内读取。"""
+
+    def test_download_completes_with_streaming_response(self):
+        """使用真正的流式 transport 下载必须成功，不能抛出 StreamClosed。"""
+        import httpcore
+        from extractors.http_downloader import download, DownloadConfig
+        from extractors.http_downloader import _StreamWrapper
+
+        class StreamingTransport(httpx.BaseTransport):
+            def handle_request(self, request: httpx.Request) -> httpx.Response:
+                core_req = httpcore.Request(
+                    method=request.method,
+                    url=str(request.url),
+                    headers=list(request.headers.items()),
+                    content=request.stream,
+                    extensions=request.extensions,
+                )
+                core_resp = httpcore.Response(
+                    200,
+                    headers=[
+                        (b"content-type", b"video/mp4"),
+                        (b"content-length", b"18"),
+                    ],
+                    content=iter([b"chunk-a-", b"chunk-b-", b"chunk-c"]),
+                )
+                return httpx.Response(
+                    status_code=core_resp.status,
+                    headers=list(core_resp.headers),
+                    stream=_StreamWrapper(core_resp.stream),
+                    extensions=core_resp.extensions,
+                    request=request,
+                )
+
+        transport = StreamingTransport()
+        config = DownloadConfig(connect_timeout=5.0, read_timeout=5.0, total_timeout=10.0)
+        with tempfile.TemporaryDirectory() as tmpdir:
+            result = download(
+                url="https://cdn.example.com/video.mp4",
+                output_dir=Path(tmpdir), filename="video.mp4",
+                config=config, _transport=transport,
+            )
+            assert result.success is True, f"download failed: {result.error}"
+            expected_body = b"chunk-a-chunk-b-chunk-c"
+            assert result.bytes_downloaded == len(expected_body)
+            assert os.path.exists(result.output_path)
+            with open(result.output_path, "rb") as f:
+                assert f.read() == expected_body
+
+    def test_streaming_body_correctly_written(self):
+        """流式数据完整写入文件，无截断。"""
+        import httpcore
+        from extractors.http_downloader import download, DownloadConfig
+        from extractors.http_downloader import _StreamWrapper
+
+        chunks = [b"AAAA", b"BBBB", b"CCCC", b"DDDD"]
+
+        class StreamingTransport(httpx.BaseTransport):
+            def handle_request(self, request: httpx.Request) -> httpx.Response:
+                core_req = httpcore.Request(
+                    method=request.method,
+                    url=str(request.url),
+                    headers=list(request.headers.items()),
+                    content=request.stream,
+                    extensions=request.extensions,
+                )
+                core_resp = httpcore.Response(
+                    200,
+                    headers=[
+                        (b"content-type", b"video/mp4"),
+                        (b"content-length", b"16"),
+                    ],
+                    content=iter(chunks),
+                )
+                return httpx.Response(
+                    status_code=core_resp.status,
+                    headers=list(core_resp.headers),
+                    stream=_StreamWrapper(core_resp.stream),
+                    extensions=core_resp.extensions,
+                    request=request,
+                )
+
+        transport = StreamingTransport()
+        config = DownloadConfig(connect_timeout=5.0, read_timeout=5.0, total_timeout=10.0)
+        with tempfile.TemporaryDirectory() as tmpdir:
+            result = download(
+                url="https://cdn.example.com/video.mp4",
+                output_dir=Path(tmpdir), filename="video.mp4",
+                config=config, _transport=transport,
+            )
+            assert result.success is True
+            with open(result.output_path, "rb") as f:
+                assert f.read() == b"AAAABBBBCCCCDDDD"
+
+
+class TestStreamReadMidFailure:
+    """流读取中途失败的清理行为。"""
+
+    def test_part_file_cleaned_on_stream_read_failure(self):
+        """流中途失败必须清理 .part，不留下损坏的最终文件。"""
+        import httpcore
+        from extractors.http_downloader import download, DownloadConfig
+        from extractors.http_downloader import _StreamWrapper
+
+        class FaultyTransport(httpx.BaseTransport):
+            def handle_request(self, request: httpx.Request) -> httpx.Response:
+                def faulty_stream():
+                    yield b"good"
+                    yield b"data"
+                    raise ConnectionError("模拟连接中断")
+
+                core_req = httpcore.Request(
+                    method=request.method,
+                    url=str(request.url),
+                    headers=list(request.headers.items()),
+                    content=request.stream,
+                    extensions=request.extensions,
+                )
+                core_resp = httpcore.Response(
+                    200,
+                    headers=[
+                        (b"content-type", b"video/mp4"),
+                        (b"content-length", b"999"),
+                    ],
+                    content=faulty_stream(),
+                )
+                return httpx.Response(
+                    status_code=core_resp.status,
+                    headers=list(core_resp.headers),
+                    stream=_StreamWrapper(core_resp.stream),
+                    extensions=core_resp.extensions,
+                    request=request,
+                )
+
+        transport = FaultyTransport()
+        config = DownloadConfig(connect_timeout=5.0, read_timeout=5.0, total_timeout=10.0)
+        with tempfile.TemporaryDirectory() as tmpdir:
+            result = download(
+                url="https://cdn.example.com/video.mp4",
+                output_dir=Path(tmpdir), filename="video.mp4",
+                config=config, _transport=transport,
+            )
+            assert result.success is False
+            # .part 必须被清理
+            part_files = list(Path(tmpdir).glob("*.part"))
+            assert len(part_files) == 0
+            # 最终文件不能存在（原子写入没执行）
+            final = Path(tmpdir) / "video.mp4"
+            assert not final.exists()
+
+
 class TestResourceCleanup:
     """Client 正确关闭测试。"""
 
