@@ -113,8 +113,10 @@ def main() -> int:
     errors = validate_config(config)
     if errors:
         for e in errors:
-            print(f"[WARN] 配置问题: {e}")
-            logger.warning(f"config_warning detail=\"{e}\"")
+            print(f"[ERROR] 配置问题: {e}")
+            logger.error(f"config_error detail=\"{e}\"")
+        print("\n[ERROR] 无法继续：请修正 config.yaml 或 config.local.yaml 中的配置问题后重试")
+        return 2
 
     # 6. 环境检查（首次下载时）
     env_ok, env_detail = _ensure_env_checked(config)

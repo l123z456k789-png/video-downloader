@@ -102,6 +102,43 @@ class TestBuildCommand:
         # 整个 URL 应该是一个参数
         assert malicious_url in cmd
 
+    def test_proxy_passed_when_configured(self):
+        """network.proxy 非空 → build_command 包含 --proxy。"""
+        cfg = {
+            **DEFAULTS,
+            "network": {"mode": "auto", "proxy": "http://127.0.0.1:7890"},
+        }
+        cmd = build_command(cfg, "https://www.youtube.com/watch?v=abc")
+        assert "--proxy" in cmd
+        proxy_idx = cmd.index("--proxy")
+        assert cmd[proxy_idx + 1] == "http://127.0.0.1:7890"
+
+    def test_no_proxy_when_proxy_empty(self):
+        """network.proxy 为空 → build_command 不含 --proxy。"""
+        cfg = {
+            **DEFAULTS,
+            "network": {"mode": "auto", "proxy": ""},
+        }
+        cmd = build_command(cfg, "https://www.youtube.com/watch?v=abc")
+        assert "--proxy" not in cmd
+
+    def test_no_proxy_when_network_section_missing(self):
+        """无 network 节 → build_command 不含 --proxy。"""
+        cfg = dict(DEFAULTS)
+        if "network" in cfg:
+            del cfg["network"]
+        cmd = build_command(cfg, "https://www.youtube.com/watch?v=abc")
+        assert "--proxy" not in cmd
+
+    def test_proxy_appears_exactly_once(self):
+        """proxy 参数只出现一次。"""
+        cfg = {
+            **DEFAULTS,
+            "network": {"mode": "auto", "proxy": "socks5://127.0.0.1:1080"},
+        }
+        cmd = build_command(cfg, "https://www.youtube.com/watch?v=abc")
+        assert cmd.count("--proxy") == 1
+
 
 class TestBuildDirectCommand:
     """build_direct_command — 为 CDN 直链构建 yt-dlp 下载命令。"""
@@ -453,6 +490,59 @@ class TestModeDispatch:
             assert result is not None
             assert len(safe_called) == 1
             assert safe_called[0] == "https://cdn.example.com/v.mp4"
+
+    def test_invalid_mode_does_not_dispatch_to_auto(self, monkeypatch):
+        """非法 network.mode 不调用 _download_auto。"""
+        auto_called = []
+
+        def fake_auto(config, url, platform, task_id):
+            auto_called.append(True)
+            import subprocess
+            return subprocess.CompletedProcess(args=[], returncode=0, stdout="", stderr="")
+
+        monkeypatch.setattr("downloader._download_auto", fake_auto)
+
+        config = dict(DEFAULTS)
+        config["network"] = {"mode": "typo", "proxy": ""}
+        config["tools"] = {"yt_dlp_path": "yt-dlp", "ffmpeg_path": "ffmpeg", "deno_path": ""}
+
+        from downloader import run_hybrid_download, DownloadError
+        with pytest.raises(DownloadError, match="network.mode"):
+            run_hybrid_download(config, "https://example.com/v.mp4", platform="unknown")
+        assert len(auto_called) == 0
+
+    def test_invalid_mode_does_not_dispatch_to_strict(self, monkeypatch):
+        """非法 network.mode 不调用 _download_strict。"""
+        strict_called = []
+
+        def fake_strict(config, url, platform, task_id):
+            strict_called.append(True)
+            import subprocess
+            return subprocess.CompletedProcess(args=[], returncode=0, stdout="", stderr="")
+
+        monkeypatch.setattr("downloader._download_strict", fake_strict)
+
+        config = dict(DEFAULTS)
+        config["network"] = {"mode": "typo", "proxy": ""}
+        config["tools"] = {"yt_dlp_path": "yt-dlp", "ffmpeg_path": "ffmpeg", "deno_path": ""}
+
+        from downloader import run_hybrid_download, DownloadError
+        with pytest.raises(DownloadError, match="network.mode"):
+            run_hybrid_download(config, "https://example.com/v.mp4", platform="unknown")
+        assert len(strict_called) == 0
+
+    def test_invalid_mode_error_message_is_clear(self, monkeypatch):
+        """非法 network.mode → DownloadError 包含 mode 名称和合法选项。"""
+        config = dict(DEFAULTS)
+        config["network"] = {"mode": "typo", "proxy": ""}
+        config["tools"] = {"yt_dlp_path": "yt-dlp", "ffmpeg_path": "ffmpeg", "deno_path": ""}
+
+        from downloader import run_hybrid_download, DownloadError
+        with pytest.raises(DownloadError) as exc_info:
+            run_hybrid_download(config, "https://example.com/v.mp4", platform="unknown")
+        err = str(exc_info.value)
+        assert "typo" in err
+        assert "auto" in err.lower() or "strict" in err.lower()
 
 
 class TestConfigPlumbing:

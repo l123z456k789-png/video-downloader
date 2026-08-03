@@ -160,6 +160,13 @@ def build_command(config: dict[str, Any], url: str) -> list[str]:
                 cmd.extend(["--user-agent", plat_override["user_agent"]])
             if "referer" in plat_override:
                 cmd.extend(["--referer", plat_override["referer"]])
+            # 注意: 如果平台配置带了 proxy，不要在这里加
+            # proxy 由 network.proxy 统一控制
+
+    # 代理
+    proxy = config.get("network", {}).get("proxy", "")
+    if proxy:
+        cmd.extend(["--proxy", proxy])
 
     # 输出路径
     cmd.extend(["-o", str(output_dir / "%(title)s.%(ext)s")])
@@ -453,8 +460,13 @@ def run_hybrid_download(
 
     if network_mode == "auto":
         return _download_auto(config, url, platform, task_id)
-    else:
+    elif network_mode == "strict":
         return _download_strict(config, url, platform, task_id)
+    else:
+        raise DownloadError(
+            f"network.mode 无效: {network_mode}，应为 auto 或 strict",
+            exit_code=2,
+        )
 
 
 def _download_auto(
