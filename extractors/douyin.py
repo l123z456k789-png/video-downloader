@@ -129,6 +129,10 @@ def _extract_from_api_json(data: dict) -> list[VideoInfo]:
             title=title,
             platform="douyin",
             ext="mp4",
+            headers={
+                "User-Agent": _HEADERS["User-Agent"],
+                "Referer": "https://www.douyin.com/",
+            },
             is_watermarked=("download" not in best_url.lower()),
         )
     ]
@@ -255,6 +259,10 @@ class DouyinExtractor(BaseExtractor):
                             title=data.get("desc", ""),
                             platform="douyin",
                             ext="mp4",
+                            headers={
+                                "User-Agent": _HEADERS["User-Agent"],
+                                "Referer": "https://www.douyin.com/",
+                            },
                         )
                     )
             else:

@@ -1316,3 +1316,436 @@ class TestResourceCleanup:
                 config=config, _transport=transport,
             )
             assert result.success is False
+
+
+# ============================================================
+# 重试逻辑测试
+# ============================================================
+
+class TestRetryLogic:
+    """max_retries 正确执行：网络瞬时异常重试，确定性错误不重试。"""
+
+    def test_retries_on_connect_error(self):
+        """max_retries=3 → ConnectError 应尝试 4 次（首次 + 3 次重试）。"""
+        import httpcore
+        from extractors.http_downloader import download, DownloadConfig
+        from extractors.http_downloader import _StreamWrapper
+
+        attempts = [0]
+
+        class RetryTransport(httpx.BaseTransport):
+            def handle_request(self, request):
+                attempts[0] += 1
+                raise httpx.ConnectError("connection refused")
+
+        transport = RetryTransport()
+        config = DownloadConfig(
+            connect_timeout=1.0, read_timeout=5.0, total_timeout=30.0,
+            max_retries=3,
+        )
+        with tempfile.TemporaryDirectory() as tmpdir:
+            result = download(
+                url="https://cdn.example.com/video.mp4",
+                output_dir=Path(tmpdir), filename="video.mp4",
+                config=config, _transport=transport,
+            )
+            assert result.success is False
+            assert attempts[0] == 4, f"expected 4 attempts (1 initial + 3 retries), got {attempts[0]}"
+
+    def test_succeeds_on_second_attempt(self):
+        """第一次 ConnectError，第二次成功。"""
+        import httpcore
+        from extractors.http_downloader import download, DownloadConfig
+        from extractors.http_downloader import _StreamWrapper
+
+        attempts = [0]
+
+        class RetryOnceTransport(httpx.BaseTransport):
+            def handle_request(self, request):
+                attempts[0] += 1
+                if attempts[0] == 1:
+                    raise httpx.ConnectError("connection refused")
+                core_req = httpcore.Request(
+                    method=request.method, url=str(request.url),
+                    headers=list(request.headers.items()),
+                    content=request.stream, extensions=request.extensions,
+                )
+                core_resp = httpcore.Response(
+                    200,
+                    headers=[(b"content-type", b"video/mp4"), (b"content-length", b"4")],
+                    content=iter([b"data"]),
+                )
+                return httpx.Response(
+                    status_code=core_resp.status,
+                    headers=list(core_resp.headers),
+                    stream=_StreamWrapper(core_resp.stream),
+                    extensions=core_resp.extensions,
+                    request=request,
+                )
+
+        transport = RetryOnceTransport()
+        config = DownloadConfig(
+            connect_timeout=1.0, read_timeout=5.0, total_timeout=30.0,
+            max_retries=2,
+        )
+        with tempfile.TemporaryDirectory() as tmpdir:
+            result = download(
+                url="https://cdn.example.com/video.mp4",
+                output_dir=Path(tmpdir), filename="video.mp4",
+                config=config, _transport=transport,
+            )
+            assert result.success is True
+            assert attempts[0] == 2
+
+    def test_exhausts_retries_then_fails(self):
+        """耗尽所有重试后返回失败。"""
+        from extractors.http_downloader import download, DownloadConfig
+
+        attempts = [0]
+
+        class AlwaysFailTransport(httpx.BaseTransport):
+            def handle_request(self, request):
+                attempts[0] += 1
+                raise httpx.ReadError("read timeout")
+
+        transport = AlwaysFailTransport()
+        config = DownloadConfig(
+            connect_timeout=1.0, read_timeout=1.0, total_timeout=30.0,
+            max_retries=2,
+        )
+        with tempfile.TemporaryDirectory() as tmpdir:
+            result = download(
+                url="https://cdn.example.com/video.mp4",
+                output_dir=Path(tmpdir), filename="video.mp4",
+                config=config, _transport=transport,
+            )
+            assert result.success is False
+            assert attempts[0] == 3  # 1 initial + 2 retries
+
+    def test_does_not_retry_content_type_error(self):
+        """Content-Type 错误不重试（确定性错误）。"""
+        from extractors.http_downloader import download, DownloadConfig
+
+        attempts = [0]
+
+        def handler(request: httpx.Request) -> httpx.Response:
+            attempts[0] += 1
+            return httpx.Response(
+                200, content=b"<html>",
+                headers={"Content-Type": "text/html", "Content-Length": "6"},
+            )
+
+        transport = httpx.MockTransport(handler)
+        config = DownloadConfig(
+            connect_timeout=5.0, read_timeout=5.0, total_timeout=10.0,
+            max_retries=3,
+        )
+        with tempfile.TemporaryDirectory() as tmpdir:
+            result = download(
+                url="https://cdn.example.com/video.mp4",
+                output_dir=Path(tmpdir), filename="video.mp4",
+                config=config, _transport=transport,
+            )
+            assert result.success is False
+            assert attempts[0] == 1  # 不重试
+
+    def test_does_not_retry_url_error(self):
+        """URL 校验失败不重试（确定性错误）。"""
+        from extractors.http_downloader import download, DownloadConfig
+
+        config = DownloadConfig(max_retries=5)
+        with tempfile.TemporaryDirectory() as tmpdir:
+            result = download(
+                url="file:///etc/passwd",
+                output_dir=Path(tmpdir), filename="video.mp4",
+                config=config,
+            )
+            assert result.success is False
+            assert "协议" in result.error
+
+
+# ============================================================
+# Stream close 传播测试
+# ============================================================
+
+class TestStreamClosePropagation:
+    """_StreamWrapper.close() 必须传播到底层 httpcore stream。"""
+
+    def test_close_propagates_to_underlying_stream(self):
+        """response.close() 必须关闭底层 httpcore stream。"""
+        import httpcore
+        from extractors.http_downloader import _StreamWrapper
+
+        close_calls = []
+
+        class CloseTrackedStream:
+            def __init__(self, data):
+                self._data = iter(data)
+            def __iter__(self):
+                return self
+            def __next__(self):
+                return next(self._data)
+            def close(self):
+                close_calls.append(True)
+
+        tracked = CloseTrackedStream([b"a", b"b"])
+        wrapper = _StreamWrapper(tracked)
+        wrapper.close()
+        assert len(close_calls) == 1, f"close() not propagated, calls={len(close_calls)}"
+        # 幂等
+        wrapper.close()
+        assert len(close_calls) == 1, "close() should be idempotent"
+
+    def test_redirect_response_closes_underlying_stream(self):
+        """重定向响应被丢弃时必须关闭底层流。"""
+        import httpcore
+        import httpx
+        from extractors.http_downloader import _StreamWrapper
+
+        close_calls = []
+
+        class CloseTrackedIter:
+            def __init__(self):
+                self._chunks = iter([b"ignore"])
+            def __iter__(self):
+                return self
+            def __next__(self):
+                return next(self._chunks)
+            def close(self):
+                close_calls.append(True)
+
+        stream = CloseTrackedIter()
+        wrapper = _StreamWrapper(stream)
+        resp = httpx.Response(
+            status_code=302,
+            headers={"Location": "https://other.example.com/v.mp4"},
+            stream=wrapper,
+        )
+        # 模拟重定向处理：不读取 body 直接关闭
+        resp.close()
+        assert len(close_calls) == 1, f"redirect response did not close stream, calls={len(close_calls)}"
+
+
+# ============================================================
+# 异常处理测试
+# ============================================================
+
+class TestExceptionHandling:
+    """预期网络异常→可控失败；程序缺陷→继续抛出。"""
+
+    def test_connect_error_becomes_controlled_failure(self):
+        """ConnectError 变成 DownloadResult(success=False)，不抛异常。"""
+        from extractors.http_downloader import download, DownloadConfig
+
+        class FailingTransport(httpx.BaseTransport):
+            def handle_request(self, request):
+                raise httpx.ConnectError("connection refused")
+
+        transport = FailingTransport()
+        config = DownloadConfig(
+            connect_timeout=1.0, read_timeout=5.0, total_timeout=10.0,
+            max_retries=0,
+        )
+        with tempfile.TemporaryDirectory() as tmpdir:
+            result = download(
+                url="https://cdn.example.com/video.mp4",
+                output_dir=Path(tmpdir), filename="video.mp4",
+                config=config, _transport=transport,
+            )
+            assert result.success is False
+            assert "connection refused" in result.error.lower() or \
+                   "connecterror" in result.error.lower()
+
+    def test_attribute_error_not_swallowed(self, monkeypatch):
+        """程序缺陷（AttributeError）不能被伪装成下载失败。"""
+        from extractors.http_downloader import download, DownloadConfig
+
+        def handler(request: httpx.Request) -> httpx.Response:
+            return httpx.Response(
+                200, content=b"data",
+                headers={"Content-Type": "video/mp4", "Content-Length": "4"},
+            )
+
+        transport = httpx.MockTransport(handler)
+        config = DownloadConfig(connect_timeout=5.0, read_timeout=5.0, total_timeout=10.0)
+
+        # 让 response.iter_bytes 抛 AttributeError
+        import extractors.http_downloader as mod
+        original = mod.DownloadResult
+        called = []
+
+        def fake_result(*args, **kwargs):
+            called.append(1)
+            if len(called) == 1:
+                raise AttributeError("simulated bug: NoneType has no attribute 'xyz'")
+            return original(*args, **kwargs)
+
+        monkeypatch.setattr(mod, "DownloadResult", fake_result)
+
+        with tempfile.TemporaryDirectory() as tmpdir:
+            with pytest.raises(AttributeError, match="simulated bug"):
+                download(
+                    url="https://cdn.example.com/video.mp4",
+                    output_dir=Path(tmpdir), filename="video.mp4",
+                    config=config, _transport=transport,
+                )
+
+
+# ============================================================
+# httpcore → httpx 异常映射测试
+# ============================================================
+
+class FakePool:
+    """模拟 httpcore ConnectionPool，可控抛异常。"""
+    def __init__(self, exc_to_raise):
+        self._exc = exc_to_raise
+        self.attempts = 0
+    def handle_request(self, request):
+        self.attempts += 1
+        if isinstance(self._exc, type):
+            raise self._exc("fake")
+        raise self._exc
+    def close(self):
+        pass
+
+
+class TestSafeTransportExceptionMapping:
+    """SafeTransport.handle_request 必须将 httpcore 异常映射为 httpx 异常。"""
+
+    def test_maps_httpcore_connect_error_to_httpx(self):
+        """httpcore.ConnectError → httpx.ConnectError。"""
+        import httpcore
+        from extractors.http_downloader import SafeTransport
+
+        transport = SafeTransport()
+        transport._pool = FakePool(httpcore.ConnectError)
+        httpx_req = httpx.Request("GET", "https://cdn.example.com/v.mp4")
+
+        with pytest.raises(httpx.ConnectError, match="fake"):
+            transport.handle_request(httpx_req)
+        assert transport._pool.attempts == 1
+
+    def test_maps_httpcore_remote_protocol_error_to_httpx(self):
+        """httpcore.RemoteProtocolError → httpx.RemoteProtocolError。"""
+        import httpcore
+        from extractors.http_downloader import SafeTransport
+
+        transport = SafeTransport()
+        transport._pool = FakePool(httpcore.RemoteProtocolError)
+        httpx_req = httpx.Request("GET", "https://cdn.example.com/v.mp4")
+
+        with pytest.raises(httpx.RemoteProtocolError, match="fake"):
+            transport.handle_request(httpx_req)
+        assert transport._pool.attempts == 1
+
+    def test_maps_httpcore_read_timeout_to_httpx(self):
+        """httpcore.ReadTimeout → httpx.ReadTimeout。"""
+        import httpcore
+        from extractors.http_downloader import SafeTransport
+
+        transport = SafeTransport()
+        transport._pool = FakePool(httpcore.ReadTimeout)
+        httpx_req = httpx.Request("GET", "https://cdn.example.com/v.mp4")
+
+        with pytest.raises(httpx.ReadTimeout, match="fake"):
+            transport.handle_request(httpx_req)
+
+
+class TestHttpcoreRetry:
+    """真实 SafeTransport 路径下 httpcore 异常触发正确重试次数。"""
+
+    def test_httpcore_connect_error_retries_4_times(self):
+        """max_retries=3 → httpcore.ConnectError 映射后重试 4 次。"""
+        import httpcore
+        from extractors.http_downloader import download, DownloadConfig, SafeTransport
+
+        transport = SafeTransport()
+        transport._pool = FakePool(httpcore.ConnectError)
+        config = DownloadConfig(
+            connect_timeout=1.0, read_timeout=5.0, total_timeout=30.0,
+            max_retries=3,
+        )
+        with tempfile.TemporaryDirectory() as tmpdir:
+            result = download(
+                url="https://cdn.example.com/video.mp4",
+                output_dir=Path(tmpdir), filename="video.mp4",
+                config=config, _transport=transport,
+            )
+            assert result.success is False
+            assert "fake" in result.error.lower()
+            assert transport._pool.attempts == 4, \
+                f"expected 4 attempts, got {transport._pool.attempts}"
+
+    def test_httpcore_remote_protocol_error_triggers_retry(self):
+        """httpcore.RemoteProtocolError 映射后进入重试。"""
+        import httpcore
+        from extractors.http_downloader import download, DownloadConfig, SafeTransport
+
+        transport = SafeTransport()
+        transport._pool = FakePool(httpcore.RemoteProtocolError)
+        config = DownloadConfig(
+            connect_timeout=1.0, read_timeout=5.0, total_timeout=30.0,
+            max_retries=2,
+        )
+        with tempfile.TemporaryDirectory() as tmpdir:
+            result = download(
+                url="https://cdn.example.com/video.mp4",
+                output_dir=Path(tmpdir), filename="video.mp4",
+                config=config, _transport=transport,
+            )
+            assert result.success is False
+            assert transport._pool.attempts == 3  # 1 + 2 retries
+
+
+class TestNonRetryableExceptions:
+    """StreamClosed/StreamConsumed 等代码缺陷不重试，原样传播。"""
+
+    def test_stream_closed_not_retried_and_propagates(self):
+        """httpx.StreamClosed 不重试，attempts=1，原样向上传播。"""
+        from extractors.http_downloader import download, DownloadConfig
+
+        attempts = [0]
+
+        class StreamClosedTransport(httpx.BaseTransport):
+            def handle_request(self, request):
+                attempts[0] += 1
+                raise httpx.StreamClosed()
+
+        transport = StreamClosedTransport()
+        config = DownloadConfig(
+            connect_timeout=1.0, read_timeout=5.0, total_timeout=10.0,
+            max_retries=3,
+        )
+        with tempfile.TemporaryDirectory() as tmpdir:
+            with pytest.raises(httpx.StreamClosed):
+                download(
+                    url="https://cdn.example.com/video.mp4",
+                    output_dir=Path(tmpdir), filename="video.mp4",
+                    config=config, _transport=transport,
+                )
+        assert attempts[0] == 1, f"StreamClosed should NOT be retried, got {attempts[0]} attempts"
+
+    def test_remote_protocol_error_is_retried(self):
+        """httpx.RemoteProtocolError 按配置进入重试。"""
+        from extractors.http_downloader import download, DownloadConfig
+
+        attempts = [0]
+
+        class RPETransport(httpx.BaseTransport):
+            def handle_request(self, request):
+                attempts[0] += 1
+                raise httpx.RemoteProtocolError("server sent invalid response")
+
+        transport = RPETransport()
+        config = DownloadConfig(
+            connect_timeout=1.0, read_timeout=5.0, total_timeout=30.0,
+            max_retries=2,
+        )
+        with tempfile.TemporaryDirectory() as tmpdir:
+            result = download(
+                url="https://cdn.example.com/video.mp4",
+                output_dir=Path(tmpdir), filename="video.mp4",
+                config=config, _transport=transport,
+            )
+            assert result.success is False
+            assert attempts[0] == 3  # 1 initial + 2 retries

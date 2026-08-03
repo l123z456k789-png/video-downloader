@@ -88,148 +88,168 @@ def download(
 
     bytes_downloaded = 0
     try:
-        # 6. 重定向循环 + 流式下载（全部在 with 块内完成）
-        current_url = url
-        current_headers = dict(headers or {})
-        visited_urls: set[str] = {url}
-        redirect_count = 0
+        # 6. 重试循环（仅网络/传输瞬时异常）
+        for attempt in range(config.max_retries + 1):
+            current_url = url
+            current_headers = dict(headers or {})
+            visited_urls: set[str] = {url}
+            redirect_count = 0
+            bytes_downloaded = 0
+            last_network_error: str = ""
 
-        while redirect_count <= config.max_redirects:
-            with client.stream(
-                "GET", current_url,
-                headers=current_headers,
-                timeout=httpx.Timeout(
-                    config.connect_timeout,
-                    connect=config.connect_timeout,
-                    read=config.read_timeout,
-                    write=config.read_timeout,
-                    pool=config.connect_timeout,
-                ),
-            ) as response:
-                # --- 重定向处理 ---
-                if response.status_code in (301, 302, 303, 307, 308):
-                    if redirect_count >= config.max_redirects:
-                        return DownloadResult(
-                            success=False, output_path="", bytes_downloaded=0,
-                            error=f"重定向次数超过上限 ({config.max_redirects})",
-                        )
-                    location = response.headers.get("Location", "")
-                    if not location:
-                        return DownloadResult(
-                            success=False, output_path="", bytes_downloaded=0,
-                            error="重定向响应缺少 Location 头",
-                        )
-                    new_url = urljoin(current_url, location)
-                    ok, err = _validate_url(new_url, allowed_domains)
-                    if not ok:
-                        return DownloadResult(
-                            success=False, output_path="", bytes_downloaded=0,
-                            error=f"重定向目标被拒绝: {err}",
-                        )
-                    # 跨域剥离敏感头
-                    new_parsed = urlparse(new_url)
-                    old_parsed = urlparse(current_url)
-                    if (new_parsed.hostname or "").rstrip(".").lower() != \
-                       (old_parsed.hostname or "").rstrip(".").lower():
-                        current_headers = {
-                            k: v for k, v in current_headers.items()
-                            if k.lower() not in ("authorization", "cookie", "proxy-authorization")
-                        }
-                    if new_url in visited_urls:
-                        return DownloadResult(
-                            success=False, output_path="", bytes_downloaded=0,
-                            error="检测到重定向循环",
-                        )
-                    current_url = new_url
-                    visited_urls.add(new_url)
-                    redirect_count += 1
-                    continue  # → 下一个 while 迭代，新的 with 块
+            try:
+                while redirect_count <= config.max_redirects:
+                    with client.stream(
+                        "GET", current_url,
+                        headers=current_headers,
+                        timeout=httpx.Timeout(
+                            config.connect_timeout,
+                            connect=config.connect_timeout,
+                            read=config.read_timeout,
+                            write=config.read_timeout,
+                            pool=config.connect_timeout,
+                        ),
+                    ) as response:
+                        # --- 重定向处理 ---
+                        if response.status_code in (301, 302, 303, 307, 308):
+                            if redirect_count >= config.max_redirects:
+                                return DownloadResult(
+                                    success=False, output_path="", bytes_downloaded=0,
+                                    error=f"重定向次数超过上限 ({config.max_redirects})",
+                                )
+                            location = response.headers.get("Location", "")
+                            if not location:
+                                return DownloadResult(
+                                    success=False, output_path="", bytes_downloaded=0,
+                                    error="重定向响应缺少 Location 头",
+                                )
+                            new_url = urljoin(current_url, location)
+                            ok, err = _validate_url(new_url, allowed_domains)
+                            if not ok:
+                                return DownloadResult(
+                                    success=False, output_path="", bytes_downloaded=0,
+                                    error=f"重定向目标被拒绝: {err}",
+                                )
+                            # 跨域剥离敏感头
+                            new_parsed = urlparse(new_url)
+                            old_parsed = urlparse(current_url)
+                            if (new_parsed.hostname or "").rstrip(".").lower() != \
+                               (old_parsed.hostname or "").rstrip(".").lower():
+                                current_headers = {
+                                    k: v for k, v in current_headers.items()
+                                    if k.lower() not in ("authorization", "cookie", "proxy-authorization")
+                                }
+                            if new_url in visited_urls:
+                                return DownloadResult(
+                                    success=False, output_path="", bytes_downloaded=0,
+                                    error="检测到重定向循环",
+                                )
+                            current_url = new_url
+                            visited_urls.add(new_url)
+                            redirect_count += 1
+                            continue
 
-                # --- 非重定向: Content-Type 检查 ---
-                content_type = response.headers.get("Content-Type", "")
-                if not _validate_content_type(content_type, config):
-                    return DownloadResult(
-                        success=False, output_path="", bytes_downloaded=0,
-                        error=f"不支持的 Content-Type: {content_type or '(缺失)'}",
-                    )
-
-                # --- Content-Length 检查 ---
-                content_length_str = response.headers.get("Content-Length", "")
-                content_length: int | None = None
-                if content_length_str:
-                    try:
-                        content_length = int(content_length_str)
-                        if content_length > config.max_size_bytes:
+                        # --- 非重定向: Content-Type 检查 ---
+                        content_type = response.headers.get("Content-Type", "")
+                        if not _validate_content_type(content_type, config):
                             return DownloadResult(
                                 success=False, output_path="", bytes_downloaded=0,
-                                error=f"文件大小 ({content_length:,} bytes) 超过限制 ({config.max_size_bytes:,} bytes)",
+                                error=f"不支持的 Content-Type: {content_type or '(缺失)'}",
                             )
-                    except ValueError:
-                        pass
 
-                # --- 磁盘空间预检查 ---
-                if content_length:
-                    ok, err = _check_disk_space(final_target.parent, content_length, config.disk_safety_ratio)
-                    if not ok:
-                        return DownloadResult(success=False, output_path="", bytes_downloaded=0, error=err)
-
-                # --- 流式下载到 .part（在 with 块内执行）---
-                start_time = time_module.monotonic()
-                total_timeout = start_time + config.total_timeout
-                last_check_bytes = 0
-                window_samples: list[tuple[float, int]] = []
-
-                try:
-                    with open(part_path, "wb") as f:
-                        for chunk in response.iter_bytes(chunk_size=8192):
-                            now = time_module.monotonic()
-
-                            if now > total_timeout:
-                                raise TimeoutError("下载总时间超时")
-
-                            f.write(chunk)
-                            bytes_downloaded += len(chunk)
-
-                            if bytes_downloaded > config.max_size_bytes:
-                                raise ValueError("实际下载大小超过限制")
-
-                            if not content_length and bytes_downloaded - last_check_bytes >= config.disk_check_interval_bytes:
-                                ok, err = _check_disk_space(final_target.parent, bytes_downloaded, 1.1)
-                                if not ok:
-                                    raise OSError(err)
-                                last_check_bytes = bytes_downloaded
-
-                            # 低速检测
-                            window_samples.append((now, bytes_downloaded))
-                            cutoff = now - config.min_speed_window_sec
-                            while window_samples and window_samples[0][0] < cutoff:
-                                window_samples.pop(0)
-                            if len(window_samples) >= 2:
-                                window_dur = now - window_samples[0][0]
-                                window_bytes = bytes_downloaded - window_samples[0][1]
-                                if window_dur >= config.min_speed_window_sec and \
-                                   window_bytes / window_dur < config.min_speed_bytes_per_sec:
-                                    raise TimeoutError(
-                                        f"下载速度过慢: {window_bytes / window_dur:.0f} B/s"
+                        # --- Content-Length 检查 ---
+                        content_length_str = response.headers.get("Content-Length", "")
+                        content_length: int | None = None
+                        if content_length_str:
+                            try:
+                                content_length = int(content_length_str)
+                                if content_length > config.max_size_bytes:
+                                    return DownloadResult(
+                                        success=False, output_path="", bytes_downloaded=0,
+                                        error=f"文件大小 ({content_length:,} bytes) 超过限制 ({config.max_size_bytes:,} bytes)",
                                     )
-                        # flush + fsync (在 with 块内，文件尚未关闭)
-                        try:
-                            f.flush()
-                            os.fsync(f.fileno())
-                        except OSError:
-                            pass
-                except (TimeoutError, ValueError, OSError, httpx.NetworkError) as e:
-                    _cleanup_part(part_path)
-                    return DownloadResult(
-                        success=False, output_path="", bytes_downloaded=bytes_downloaded, error=str(e),
-                    )
+                            except ValueError:
+                                pass
 
-                # --- 原子改名 ---
-                os.replace(part_path, final_target)
+                        # --- 磁盘空间预检查 ---
+                        if content_length:
+                            ok, err = _check_disk_space(final_target.parent, content_length, config.disk_safety_ratio)
+                            if not ok:
+                                return DownloadResult(success=False, output_path="", bytes_downloaded=0, error=err)
+
+                        # --- 流式下载到 .part（在 with 块内执行）---
+                        start_time = time_module.monotonic()
+                        total_timeout = start_time + config.total_timeout
+                        last_check_bytes = 0
+                        window_samples: list[tuple[float, int]] = []
+
+                        try:
+                            with open(part_path, "wb") as f:
+                                for chunk in response.iter_bytes(chunk_size=8192):
+                                    now = time_module.monotonic()
+
+                                    if now > total_timeout:
+                                        raise TimeoutError("下载总时间超时")
+
+                                    f.write(chunk)
+                                    bytes_downloaded += len(chunk)
+
+                                    if bytes_downloaded > config.max_size_bytes:
+                                        raise ValueError("实际下载大小超过限制")
+
+                                    if not content_length and bytes_downloaded - last_check_bytes >= config.disk_check_interval_bytes:
+                                        ok, err = _check_disk_space(final_target.parent, bytes_downloaded, 1.1)
+                                        if not ok:
+                                            raise OSError(err)
+                                        last_check_bytes = bytes_downloaded
+
+                                    # 低速检测
+                                    window_samples.append((now, bytes_downloaded))
+                                    cutoff = now - config.min_speed_window_sec
+                                    while window_samples and window_samples[0][0] < cutoff:
+                                        window_samples.pop(0)
+                                    if len(window_samples) >= 2:
+                                        window_dur = now - window_samples[0][0]
+                                        window_bytes = bytes_downloaded - window_samples[0][1]
+                                        if window_dur >= config.min_speed_window_sec and \
+                                           window_bytes / window_dur < config.min_speed_bytes_per_sec:
+                                            raise TimeoutError(
+                                                f"下载速度过慢: {window_bytes / window_dur:.0f} B/s"
+                                            )
+                                # flush + fsync (在 with 块内)
+                                try:
+                                    f.flush()
+                                    os.fsync(f.fileno())
+                                except OSError:
+                                    pass
+                        except (httpx.NetworkError, httpx.TimeoutException,
+                                httpx.StreamError, ConnectionError):
+                            raise  # 传播到外层重试逻辑
+
+                        # --- 原子改名 ---
+                        os.replace(part_path, final_target)
+                        return DownloadResult(
+                            success=True,
+                            output_path=str(final_target),
+                            bytes_downloaded=bytes_downloaded,
+                        )
+
+            except (httpx.TransportError, ConnectionError, TimeoutError) as e:
+                # 网络/传输瞬时异常 → 可重试
+                # 注意：StreamError(RuntimeError)是代码缺陷，不在此列
+                last_network_error = str(e)
+                _cleanup_part(part_path)
+                if attempt < config.max_retries:
+                    continue
                 return DownloadResult(
-                    success=True,
-                    output_path=str(final_target),
-                    bytes_downloaded=bytes_downloaded,
+                    success=False, output_path="", bytes_downloaded=0,
+                    error=f"网络错误（已重试{config.max_retries}次）: {last_network_error}",
+                )
+            except (ValueError, OSError, TimeoutError) as e:
+                # 确定性错误不重试（文件大小超限、磁盘不足、总超时、速度过慢）
+                _cleanup_part(part_path)
+                return DownloadResult(
+                    success=False, output_path="", bytes_downloaded=0, error=str(e),
                 )
 
     finally:
@@ -257,6 +277,14 @@ class _StreamWrapper(httpx.SyncByteStream):
             closer = getattr(self._stream, "close", None)
             if closer is not None:
                 closer()
+
+    def close(self) -> None:
+        if self._closed:
+            return
+        self._closed = True
+        closer = getattr(self._stream, "close", None)
+        if closer is not None:
+            closer()
 
 
 class SafeNetworkBackend(httpcore.SyncBackend):
@@ -288,6 +316,43 @@ class SafeNetworkBackend(httpcore.SyncBackend):
         return stream
 
 
+# httpcore → httpx 异常映射表（与 httpx._transports.default._load_httpcore_exceptions 一致）
+_HTTPCORE_TO_HTTPX: dict[type[Exception], type[httpx.HTTPError]] = {
+    httpcore.TimeoutException: httpx.TimeoutException,
+    httpcore.ConnectTimeout: httpx.ConnectTimeout,
+    httpcore.ReadTimeout: httpx.ReadTimeout,
+    httpcore.WriteTimeout: httpx.WriteTimeout,
+    httpcore.PoolTimeout: httpx.PoolTimeout,
+    httpcore.NetworkError: httpx.NetworkError,
+    httpcore.ConnectError: httpx.ConnectError,
+    httpcore.ReadError: httpx.ReadError,
+    httpcore.WriteError: httpx.WriteError,
+    httpcore.ProxyError: httpx.ProxyError,
+    httpcore.UnsupportedProtocol: httpx.UnsupportedProtocol,
+    httpcore.ProtocolError: httpx.ProtocolError,
+    httpcore.LocalProtocolError: httpx.LocalProtocolError,
+    httpcore.RemoteProtocolError: httpx.RemoteProtocolError,
+}
+
+
+def _map_httpcore_exception(exc: Exception) -> None:
+    """将 httpcore 异常映射为对应的 httpx 异常并重新抛出。
+
+    选择最具体的映射（与 httpx._transports.default.map_httpcore_exceptions 一致）。
+    """
+    mapped_exc: type[httpx.HTTPError] | None = None
+    for from_exc, to_exc in _HTTPCORE_TO_HTTPX.items():
+        if not isinstance(exc, from_exc):
+            continue
+        if mapped_exc is None or issubclass(to_exc, mapped_exc):
+            mapped_exc = to_exc
+    if mapped_exc is not None:
+        mapped = mapped_exc(str(exc))
+        mapped.__cause__ = exc
+        raise mapped from exc
+    raise  # 非 httpcore 异常原样传播
+
+
 class SafeTransport(httpx.BaseTransport):
     """安全的 httpx 传输层 — 注入自定义 NetworkBackend。"""
 
@@ -303,7 +368,10 @@ class SafeTransport(httpx.BaseTransport):
             content=request.stream,
             extensions=request.extensions,
         )
-        core_response = self._pool.handle_request(core_request)
+        try:
+            core_response = self._pool.handle_request(core_request)
+        except Exception as exc:
+            _map_httpcore_exception(exc)
         return httpx.Response(
             status_code=core_response.status,
             headers=list(core_response.headers),
@@ -441,7 +509,11 @@ def _resolve_public_ips(host: str) -> set[str]:
             f"DNS 解析包含公网和私网地址，拒绝连接: host={host}"
         )
     if not ip_set:
-        raise OSError(f"未找到公网地址: host={host}")
+        raise OSError(
+            f"未找到公网地址: host={host}。"
+            f"strict 模式拒绝了 DNS 返回的非公网地址；"
+            f"桌面环境可使用 auto 模式，服务器安全场景应使用真实 DNS"
+        )
 
     return ip_set
 

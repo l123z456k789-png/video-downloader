@@ -29,6 +29,9 @@ class VideoInfo:
     ext: str = "mp4"
     """文件扩展名"""
 
+    headers: dict = field(default_factory=dict)
+    """下载直链时需要的 HTTP 请求头（User-Agent、Referer 等）"""
+
     metadata: dict = field(default_factory=dict)
     """额外元数据（作者、分辨率等）"""
 

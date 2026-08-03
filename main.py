@@ -134,7 +134,7 @@ def main() -> int:
     })
 
     try:
-        run_hybrid_download(config, url, platform=platform)
+        run_hybrid_download(config, url, platform=platform, task_id=task_id)
     except KeyboardInterrupt:
         print("\n[INFO] 用户取消")
         log_event(task_id, "download_cancelled", {"platform": platform}, level="WARNING")

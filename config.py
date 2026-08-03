@@ -36,6 +36,14 @@ DEFAULTS: dict[str, Any] = {
         "codec": "aac",
         "bitrate": "192k",
     },
+    "network": {
+        "mode": "auto",
+        "proxy": "",
+    },
+    "cookies": {
+        "mode": "none",
+        "file": "",
+    },
     "logging": {
         "level": "INFO",
         "directory": "logs",
@@ -138,5 +146,15 @@ def validate_config(config: dict[str, Any]) -> list[str]:
     log_level = config["logging"]["level"]
     if log_level not in ("DEBUG", "INFO", "WARNING", "ERROR", "CRITICAL"):
         errors.append(f"logging.level 无效: {log_level}")
+
+    # network.mode
+    network_mode = config.get("network", {}).get("mode", "auto")
+    if network_mode not in ("auto", "strict"):
+        errors.append(f"network.mode 无效: {network_mode}，应为 auto 或 strict")
+
+    # cookies.mode
+    cookie_mode = config.get("cookies", {}).get("mode", "none")
+    if cookie_mode not in ("none", "browser", "file"):
+        errors.append(f"cookies.mode 无效: {cookie_mode}，应为 none/browser/file")
 
     return errors
