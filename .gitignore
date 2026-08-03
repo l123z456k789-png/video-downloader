@@ -44,3 +44,9 @@ old/
 
 # 浏览器 profile（持久化登录状态）
 douyin_profile/
+
+# 烟雾测试输出
+smoke_output/
+
+# docs (design & planning)
+docs/
