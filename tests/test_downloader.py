@@ -787,6 +787,33 @@ class TestProcessCancellation:
 
         assert process.terminated is True
 
+    def test_keyboard_interrupt_while_waiting_terminates_child(self, monkeypatch, tmp_path):
+        import downloader
+
+        class FakeProcess:
+            stdout = []
+
+            def __init__(self):
+                self.terminated = False
+                self.wait_calls = 0
+
+            def terminate(self):
+                self.terminated = True
+
+            def wait(self, timeout=None):
+                self.wait_calls += 1
+                if self.wait_calls == 1:
+                    raise KeyboardInterrupt
+                return 0
+
+        process = FakeProcess()
+        monkeypatch.setattr(downloader.subprocess, "Popen", lambda *args, **kwargs: process)
+
+        with pytest.raises(KeyboardInterrupt):
+            downloader._run_process(["yt-dlp", "https://example.com/v"], tmp_path, tmp_path / ".tmp")
+
+        assert process.terminated is True
+
 
 class TestFallbackLoggingCompleteness:
     """所有回退路径都有 start + complete/failed。"""

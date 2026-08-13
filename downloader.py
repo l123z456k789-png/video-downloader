@@ -419,6 +419,7 @@ def _run_process(
                 if len(line) < 300:
                     print(line, flush=True)
                 collected_output.append(line)
+        exit_code = process.wait()
     except KeyboardInterrupt:
         process.terminate()
         try:
@@ -427,8 +428,6 @@ def _run_process(
             process.kill()
             process.wait()
         raise
-
-    exit_code = process.wait()
 
     return subprocess.CompletedProcess(
         args=cmd,
