@@ -539,6 +539,27 @@ class TestRedirectHandling:
             assert result.success is False
             assert "域名" in result.error or "白名单" in result.error
 
+    def test_rejects_404_octet_stream_without_creating_output(self):
+        from extractors.http_downloader import download, DownloadConfig
+
+        def handler(request: httpx.Request) -> httpx.Response:
+            return httpx.Response(
+                404, content=b"not-a-video",
+                headers={"Content-Type": "application/octet-stream", "Content-Length": "11"},
+            )
+
+        transport = httpx.MockTransport(handler)
+        config = DownloadConfig(connect_timeout=5.0, read_timeout=5.0, total_timeout=10.0)
+        with tempfile.TemporaryDirectory() as tmpdir:
+            result = download(
+                url="https://cdn.example.com/missing.mp4",
+                output_dir=Path(tmpdir), filename="missing.mp4",
+                config=config, _transport=transport,
+            )
+            assert result.success is False
+            assert "404" in result.error
+            assert list(Path(tmpdir).iterdir()) == []
+
     def test_handles_relative_redirect(self):
         from extractors.http_downloader import download, DownloadConfig
 
@@ -792,6 +813,30 @@ class TestTimeoutAndSpeed:
             )
             assert result.success is False
             assert "超时" in result.error or "timeout" in result.error.lower()
+
+    def test_total_timeout_is_not_retried(self):
+        from extractors.http_downloader import download, DownloadConfig
+
+        attempts = [0]
+
+        def handler(request: httpx.Request) -> httpx.Response:
+            attempts[0] += 1
+            return httpx.Response(
+                200, content=b"x",
+                headers={"Content-Type": "video/mp4", "Content-Length": "1"},
+            )
+
+        transport = httpx.MockTransport(handler)
+        config = DownloadConfig(total_timeout=-1.0, max_retries=3)
+        with tempfile.TemporaryDirectory() as tmpdir:
+            result = download(
+                url="https://cdn.example.com/slow.mp4",
+                output_dir=Path(tmpdir), filename="video.mp4",
+                config=config, _transport=transport,
+            )
+
+        assert result.success is False
+        assert attempts[0] == 1
 
 
 # ============================================================

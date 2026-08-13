@@ -52,12 +52,12 @@ pip install -r requirements.txt
 python main.py --check
 ```
 
-三个都 `[OK]` 就行了。
+看到 yt-dlp 和 FFmpeg 都是 `[OK]` 就行了。
 
-> yt-dlp、FFmpeg、Deno 会被 `pip install -r requirements.txt` 自动安装。如果自动安装失败，也可以手动安装：
-> - yt-dlp: `pip install yt-dlp`
+> `pip install -r requirements.txt` 会安装 yt-dlp 和项目的 Python 依赖。外部工具需要单独安装：
 > - FFmpeg: `winget install ffmpeg` (或 https://www.gyan.dev/ffmpeg/builds/)
-> - Deno: `winget install deno` (可选，部分网站 JS 渲染需要)
+> - Google Chrome: 抖音专用提取器需要系统已安装 Chrome
+> - Deno: `winget install deno` (可选，只有部分网站需要)
 
 ### macOS
 
@@ -88,7 +88,7 @@ pip install -r requirements.txt
 - 试试在抖音 APP 里点"分享" → "复制链接"，用短链接
 - 在浏览器打开链接确认视频能播放
 - 需要登录的视频：关掉 Chrome 再下载（程序需要读浏览器 Cookie）
-- 首次使用需要安装 Playwright 浏览器：`playwright install chromium`
+- 确保系统已安装 Google Chrome（专用提取器会启动 Chrome）
 
 **B站只能下 480P，怎么下高清？**
 
@@ -121,7 +121,7 @@ B站、抖音、YouTube、TikTok、小红书、微博、Twitter、Instagram、�
 # 下载引擎
 network:
   mode: auto          # auto = yt-dlp（推荐，直连/透明代理都能用）
-                      # strict = 安全直链下载（对网络环境要求高，仅服务器场景推荐）
+                      # strict = 安全直链优先；失败时仍回退 yt-dlp 保持网站覆盖率
   proxy: ""           # 可选 HTTP/SOCKS5 代理
 
 # Cookie 来源
@@ -138,7 +138,9 @@ downloader:
 
 ### strict 模式的限制
 
-strict 模式使用内置的 DNS/IP 安全校验，会拒绝透明代理（TUN）返回的非公网地址。桌面环境请使用 auto 模式。strict 仅适用于：
+strict 模式的直链阶段使用内置 DNS/IP 安全校验，会拒绝透明代理（TUN）返回的非公网地址。直链失败时仍会回退 yt-dlp 以保持网站覆盖率，此阶段不经过 strict IP 校验，程序会明确警告。因此 strict 是“安全直链优先”，不是全链路网络沙箱。
+
+桌面环境通常使用 auto 模式。strict 的直链阶段适用于：
 - 服务器直连环境（真实 DNS 解析）
 - 需要对下载目标做 IP 白名单校验的安全场景
 
@@ -167,7 +169,7 @@ auto 模式（默认）：
 strict 模式：
   原始 URL → 专用提取器（如有）
            → SafeTransport 安全 HTTP 下载
-           → 失败则用原始 URL 回退 yt-dlp
+           → 失败则用原始 URL 回退 yt-dlp（会警告已离开 strict IP 校验）
 ```
 
 **抖音下载流程 (auto 模式)：**

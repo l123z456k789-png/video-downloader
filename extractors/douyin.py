@@ -17,6 +17,7 @@ import re
 import time
 from pathlib import Path
 from typing import Any
+from urllib.parse import urlparse
 
 from .base import BaseExtractor, ExtractResult, VideoInfo, register
 
@@ -150,7 +151,14 @@ class DouyinExtractor(BaseExtractor):
         self._profile_dir = str(root / "douyin_profile")
 
     def supports(self, url: str) -> bool:
-        return any(domain in url for domain in DOUYIN_DOMAINS)
+        try:
+            hostname = (urlparse(url).hostname or "").lower().rstrip(".")
+        except ValueError:
+            return False
+        return any(
+            hostname == domain or hostname.endswith("." + domain)
+            for domain in DOUYIN_DOMAINS
+        )
 
     def extract(self, url: str, cookies: dict | None = None) -> ExtractResult:
         try:
@@ -183,7 +191,6 @@ class DouyinExtractor(BaseExtractor):
                 headless=True,
                 args=[
                     "--disable-blink-features=AutomationControlled",
-                    "--no-sandbox",
                     "--disable-dev-shm-usage",
                 ],
                 viewport={"width": 1920, "height": 1080},

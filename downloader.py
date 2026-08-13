@@ -426,7 +426,7 @@ def _run_process(
         except subprocess.TimeoutExpired:
             process.kill()
             process.wait()
-        raise DownloadError("用户取消下载", exit_code=-2)
+        raise
 
     exit_code = process.wait()
 
@@ -630,6 +630,7 @@ def _download_strict(
     ext = find_extractor(url)
     if ext is None:
         log_event(task_id, "no_extractor_found", {"platform": platform})
+        _warn_strict_fallback()
         return run_download(config, url)
 
     log_event(task_id, "extractor_start", {"platform": ext.platform})
@@ -644,6 +645,7 @@ def _download_strict(
             "error": str(extractor_exc)[:200],
         }, level="WARNING")
         print(f"[WARN] 提取器异常: {extractor_exc}，回退到 yt-dlp")
+        _warn_strict_fallback()
         log_event(task_id, "fallback_start", {"platform": platform, "reason": "extractor_exception"})
         try:
             fb_result = run_download(config, url)
@@ -667,6 +669,7 @@ def _download_strict(
         }, level="WARNING")
         print(f"[WARN] 提取器失败: {result.error}")
         print("[INFO] 回退到 yt-dlp 下载...")
+        _warn_strict_fallback()
         log_event(task_id, "fallback_start", {"platform": platform, "reason": "extractor_no_result"})
         try:
             fb_result = run_download(config, url)
@@ -761,6 +764,7 @@ def _download_strict(
         "platform": platform, "reason": fallback_reason[:300],
     }, level="WARNING")
     print(f"\n[WARN] 直链下载全部失败，回退到 yt-dlp...")
+    _warn_strict_fallback()
 
     log_event(task_id, "fallback_start", {
         "platform": platform, "reason": "direct_download_failed",
@@ -780,3 +784,8 @@ def _download_strict(
             f"yt-dlp 回退也失败: {yt_error}",
             exit_code=yt_error.exit_code if yt_error.exit_code > 0 else -1,
         )
+
+
+def _warn_strict_fallback() -> None:
+    """说明 strict 模式回退 yt-dlp 时的安全边界。"""
+    print("[WARN] 已回退 yt-dlp，此阶段不受 strict IP 校验保护")

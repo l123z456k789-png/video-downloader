@@ -2,6 +2,8 @@
 
 from __future__ import annotations
 
+from types import SimpleNamespace
+
 
 class TestDouyinApiJsonExtraction:
     """抖音 API JSON → VideoInfo 转换（不依赖 Playwright）。"""
@@ -63,3 +65,67 @@ class TestVideoInfo:
         assert v.headers == {}
         assert v.is_watermarked is True
         assert v.metadata == {}
+
+
+class TestDouyinUrlRouting:
+    """DouyinExtractor 只接受真实的抖音域名。"""
+
+    def test_accepts_douyin_domain_and_subdomains(self):
+        from extractors.douyin import DouyinExtractor
+
+        extractor = DouyinExtractor()
+        assert extractor.supports("https://douyin.com/video/1") is True
+        assert extractor.supports("https://v.douyin.com/abc/") is True
+
+    def test_rejects_douyin_text_outside_hostname(self):
+        from extractors.douyin import DouyinExtractor
+
+        extractor = DouyinExtractor()
+        assert extractor.supports(
+            "https://evil.example/?next=https://www.douyin.com/video/1"
+        ) is False
+        assert extractor.supports("https://douyin.com.evil.example/video/1") is False
+
+
+class TestDouyinBrowserLaunch:
+    def test_launches_chrome_without_disabling_sandbox(self, monkeypatch):
+        import playwright.sync_api
+        from extractors.douyin import DouyinExtractor
+
+        launch_options = {}
+
+        class FakePage:
+            def on(self, event, callback):
+                pass
+
+            def goto(self, url, **kwargs):
+                pass
+
+            def wait_for_timeout(self, milliseconds):
+                pass
+
+            def evaluate(self, script):
+                return ""
+
+        class FakeContext:
+            pages = [FakePage()]
+
+            def close(self):
+                pass
+
+        class FakeChromium:
+            def launch_persistent_context(self, **kwargs):
+                launch_options.update(kwargs)
+                return FakeContext()
+
+        fake_pw = SimpleNamespace(chromium=FakeChromium(), stop=lambda: None)
+        monkeypatch.setattr(
+            playwright.sync_api,
+            "sync_playwright",
+            lambda: SimpleNamespace(start=lambda: fake_pw),
+        )
+
+        result = DouyinExtractor().extract("https://www.douyin.com/video/1")
+
+        assert result.success is False
+        assert "--no-sandbox" not in launch_options["args"]

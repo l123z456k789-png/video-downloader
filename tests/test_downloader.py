@@ -712,7 +712,7 @@ class TestHybridExceptionHandling:
             with pytest.raises(AttributeError, match="NoneType"):
                 run_hybrid_download(config, "https://v.douyin.com/test/", platform="douyin")
 
-    def test_connect_error_triggers_fallback(self, monkeypatch):
+    def test_connect_error_triggers_fallback(self, monkeypatch, capsys):
         """strict 模式: safe_download 抛出 ConnectError → 记录失败、触发 yt-dlp 回退。"""
         import subprocess
         import tempfile
@@ -755,6 +755,37 @@ class TestHybridExceptionHandling:
             assert result is not None
             assert result.returncode == 0
             assert len(fallback_called) == 1
+            output = capsys.readouterr().out
+            assert "不受 strict IP 校验保护" in output
+
+
+class TestProcessCancellation:
+    def test_keyboard_interrupt_terminates_child_and_propagates(self, monkeypatch, tmp_path):
+        import downloader
+
+        class InterruptingOutput:
+            def __iter__(self):
+                raise KeyboardInterrupt
+
+        class FakeProcess:
+            stdout = InterruptingOutput()
+
+            def __init__(self):
+                self.terminated = False
+
+            def terminate(self):
+                self.terminated = True
+
+            def wait(self, timeout=None):
+                return 0
+
+        process = FakeProcess()
+        monkeypatch.setattr(downloader.subprocess, "Popen", lambda *args, **kwargs: process)
+
+        with pytest.raises(KeyboardInterrupt):
+            downloader._run_process(["yt-dlp", "https://example.com/v"], tmp_path, tmp_path / ".tmp")
+
+        assert process.terminated is True
 
 
 class TestFallbackLoggingCompleteness:

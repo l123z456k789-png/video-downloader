@@ -149,6 +149,12 @@ def download(
                             redirect_count += 1
                             continue
 
+                        if not 200 <= response.status_code < 300:
+                            return DownloadResult(
+                                success=False, output_path="", bytes_downloaded=0,
+                                error=f"HTTP 请求失败: {response.status_code}",
+                            )
+
                         # --- 非重定向: Content-Type 检查 ---
                         content_type = response.headers.get("Content-Type", "")
                         if not _validate_content_type(content_type, config):
@@ -234,7 +240,7 @@ def download(
                             bytes_downloaded=bytes_downloaded,
                         )
 
-            except (httpx.TransportError, ConnectionError, TimeoutError) as e:
+            except (httpx.TransportError, ConnectionError) as e:
                 # 网络/传输瞬时异常 → 可重试
                 # 注意：StreamError(RuntimeError)是代码缺陷，不在此列
                 last_network_error = str(e)
